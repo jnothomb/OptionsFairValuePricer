@@ -8,6 +8,10 @@ from src.utils.helpers import (
     calculate_breakeven
 )
 from src.utils.probability import ProbabilityCalculator
+from src.utils.greeks import GreeksCalculator, PortfolioGreeks
+from src.utils.visualizations import GreeksVisualizer
+from src.utils.risk_manager import RiskManager, RiskThresholds
+from typing import List, Dict
 
 """
 1. An OptionStrategies class with common option strategies:
@@ -26,9 +30,89 @@ from src.utils.probability import ProbabilityCalculator
 """
 
 class OptionStrategies:
+    """
+    Implementation of various option trading strategies with risk analysis
+    
+    Features:
+    - Strategy construction
+    - Greeks calculation
+    - Risk analysis
+    - Position visualization
+    - Adjustment suggestions
+    
+    Each strategy includes:
+    - Probability analysis
+    - Greeks analysis
+    - Risk metrics
+    - Visual analytics
+    """
+    
     def __init__(self, spot_price, risk_free_rate):
         self.spot = spot_price
         self.rf_rate = risk_free_rate
+        self.risk_manager = RiskManager()
+        self.visualizer = GreeksVisualizer()
+
+    def _calculate_strategy_greeks(self, strategy_positions):
+        """Calculate Greeks for a strategy"""
+        portfolio = PortfolioGreeks(strategy_positions)
+        greeks = portfolio.calculate_portfolio_greeks()
+        risk_metrics = portfolio.risk_metrics()
+        
+        return {
+            'greeks': greeks,
+            'risk_metrics': risk_metrics
+        }
+
+    def analyze_strategy(self, strategy_name: str, positions: List[Dict], 
+                        strategy_value: float):
+        """
+        Comprehensive strategy analysis including Greeks and risk metrics
+        
+        Args:
+            strategy_name: Name of the strategy being analyzed
+            positions: List of option positions in the strategy
+            strategy_value: Total value of the strategy
+            
+        Returns:
+            Dict containing:
+            - Greeks values
+            - Risk metrics
+            - Risk violations
+            - Suggested adjustments
+            - Visualization objects
+            
+        Note: This is the main analysis entry point for all strategies
+        """
+        # Calculate Greeks
+        portfolio = PortfolioGreeks(positions)
+        greeks = portfolio.calculate_portfolio_greeks()
+        risk_metrics = portfolio.risk_metrics()
+        
+        # Risk analysis
+        risk_violations = self.risk_manager.check_position_risks(
+            greeks, strategy_value
+        )
+        adjustments = self.risk_manager.suggest_position_adjustments(
+            greeks, strategy_value
+        )
+        
+        # Create visualizations
+        price_range = np.linspace(self.spot * 0.8, self.spot * 1.2, 100)
+        greeks_plot = self.visualizer.plot_greeks_sensitivity(
+            positions, price_range
+        )
+        
+        return {
+            'strategy_name': strategy_name,
+            'greeks': greeks,
+            'risk_metrics': risk_metrics,
+            'risk_violations': risk_violations,
+            'suggested_adjustments': adjustments,
+            'visualizations': {
+                'greeks_sensitivity': greeks_plot
+            }
+        }
 
     def iron_condor(self, volatility, days_to_expiry, width=5, wing_distance=10):
         """
@@ -90,6 +174,31 @@ class OptionStrategies:
         
         expected_value = prob_calc.expected_value(payoff_func)
         
+        # Add positions for Greeks calculation
+        positions = [
+            {
+                'option_type': 'put',
+                'quantity': -1,
+                'spot_price': self.spot,
+                'strike': put_short,
+                'time_to_expiry': days_to_expiry/365,
+                'risk_free_rate': self.rf_rate,
+                'volatility': volatility
+            },
+            {
+                'option_type': 'put',
+                'quantity': 1,
+                'spot_price': self.spot,
+                'strike': put_long,
+                'time_to_expiry': days_to_expiry/365,
+                'risk_free_rate': self.rf_rate,
+                'volatility': volatility
+            },
+            # Add call positions similarly
+        ]
+        
+        greeks_analysis = self._calculate_strategy_greeks(positions)
+        
         # Add probability metrics to the return dictionary
         result = {
             'strategy': 'Iron Condor',
@@ -110,10 +219,20 @@ class OptionStrategies:
                     put_short + premium/2,
                     call_short - premium/2
                 )
-            }
+            },
+            'greeks_analysis': greeks_analysis
         }
         
-        return result
+        analysis = self.analyze_strategy(
+            'Iron Condor',
+            positions,
+            position_value=max_risk
+        )
+        
+        return {
+            **result,  # Previous strategy results
+            'analysis': analysis
+        }
 
     def bull_call_spread(self, volatility, days_to_expiry, width=5):
         """
