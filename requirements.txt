@@ -6,3 +6,5 @@ yfinance>=0.1.70
 pandas_ta>=0.3.14b0
 matplotlib>=3.4.0
 seaborn>=0.11.0
+scikit-learn>=1.0.0
+arch>=5.0.0
