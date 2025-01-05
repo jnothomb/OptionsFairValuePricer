@@ -111,42 +111,79 @@ class VolatilityAnalyzer:
                  historical_data: Optional[pd.DataFrame] = None):
         """
         Initialize analyzer with market and historical data
-        
-        Args:
-            market_data: DataFrame containing current options market data
-                Required columns:
-                - strike: Option strike prices
-                - expiry: Time to expiration in years
-                - implied_vol: Market implied volatilities
-                - option_type: 'call' or 'put'
-                - underlying_price: Current price of underlying
-            
-            historical_data: Optional DataFrame with historical data
-                Required columns:
-                - date: Observation dates
-                - price: Historical underlying prices
-                - historical_vol: Realized volatility
-        
-        Raises:
-            ValueError: If required columns are missing
         """
-        self.market_data = market_data
-        self.historical_data = historical_data
-        self.spot_price = market_data['underlying_price'].iloc[0]
-        self._validate_input_data()
+        # Validate and process market data first
+        if not isinstance(market_data, pd.DataFrame):
+            raise ValueError("Market data must be a pandas DataFrame")
+            
+        self._validate_market_data(market_data)
+        self.market_data = market_data.copy()  # Create a copy for safety
+        
+        # Store spot price before any other processing
+        self.spot_price = float(market_data['underlying_price'].iloc[0])
+        
+        # Process historical data if provided
+        if historical_data is not None:
+            if not isinstance(historical_data, pd.DataFrame):
+                raise ValueError("Historical data must be a pandas DataFrame")
+            self._validate_historical_data(historical_data)
+            self.historical_data = historical_data.copy()  # Create a copy for safety
+        else:
+            self.historical_data = None
 
-    def _validate_input_data(self):
-        """Validate input data completeness and format"""
-        required_columns = ['strike', 'expiry', 'implied_vol', 'option_type']
+    def _validate_market_data(self, market_data: pd.DataFrame) -> None:
+        """Validate market data completeness and format"""
+        required_columns = ['strike', 'expiry', 'implied_vol', 'option_type', 'underlying_price']
         
-        if not all(col in self.market_data.columns for col in required_columns):
-            raise ValueError(f"Market data missing required columns: {required_columns}")
+        # Check required columns
+        missing_cols = [col for col in required_columns if col not in market_data.columns]
+        if missing_cols:
+            raise ValueError(f"Market data missing required columns: {missing_cols}")
         
-        if self.market_data.isnull().any().any():
+        # Validate data types and ranges
+        if not all(market_data['strike'] > 0):
+            raise ValueError("Strike prices must be positive")
+        
+        if not all(market_data['expiry'] > 0):
+            raise ValueError("Expiry times must be positive")
+        
+        if not all(market_data['implied_vol'] > 0):
+            raise ValueError("Implied volatilities must be positive")
+        
+        if not all(market_data['underlying_price'] > 0):
+            raise ValueError("Underlying prices must be positive")
+        
+        if not all(market_data['option_type'].isin(['call', 'put'])):
+            raise ValueError("Option types must be 'call' or 'put'")
+        
+        if market_data.isnull().any().any():
             raise ValueError("Market data contains NaN values")
+            
+        # Validate consistency
+        if len(set(market_data['underlying_price'])) > 1:
+            raise ValueError("Inconsistent underlying prices in market data")
+
+    def _validate_historical_data(self, historical_data: pd.DataFrame) -> None:
+        """Validate historical data completeness and format"""
+        required_columns = ['date', 'price', 'historical_vol']
         
-        if len(self.market_data) < 5:
-            raise ValueError("Insufficient market data points")
+        # Check required columns
+        missing_cols = [col for col in required_columns if col not in historical_data.columns]
+        if missing_cols:
+            raise ValueError(f"Historical data missing required columns: {missing_cols}")
+        
+        # Validate data types and ranges
+        if not pd.api.types.is_datetime64_any_dtype(historical_data['date']):
+            raise ValueError("Date column must be datetime type")
+        
+        if not all(historical_data['price'] > 0):
+            raise ValueError("Historical prices must be positive")
+        
+        if not all(historical_data['historical_vol'] >= 0):
+            raise ValueError("Historical volatilities must be non-negative")
+        
+        if historical_data.isnull().any().any():
+            raise ValueError("Historical data contains NaN values")
 
     def construct_vol_surface(self, method: str = 'cubic') -> VolatilitySurface:
         """
@@ -198,61 +235,246 @@ class VolatilityAnalyzer:
     def detect_volatility_regime(self, window: int = 60) -> VolatilityRegime:
         """
         Detect current volatility regime using multiple indicators
-        
-        Methodology:
-        1. Calculate regime indicators:
-           - Absolute volatility levels
-           - Volatility of volatility
-           - Term structure slope
-           - Smile characteristics
-        
-        2. Apply classification algorithm:
-           - K-means clustering
-           - Threshold-based classification
-           - Historical pattern matching
-        
-        3. Calculate transition probabilities:
-           - Historical regime transitions
-           - Current market conditions
-           - Regime stability metrics
-        
-        Args:
-            window: Lookback window for regime detection (trading days)
-        
-        Returns:
-            VolatilityRegime: Current regime classification and characteristics
-        
-        Note:
-            Longer windows provide more stable regime detection but may
-            be less responsive to regime changes
         """
         if self.historical_data is None:
-            raise ValueError("Historical data required for regime detection")
+            # Default to normal regime if no historical data
+            metrics = {
+                'vol_level': 0.2,
+                'vol_of_vol': 0.0,
+                'term_slope': self._calculate_term_slope(),
+                'regime_stability': 1.0
+            }
+            return VolatilityRegime('normal', metrics, 
+                                  {'low_vol': 0.3, 'normal': 0.4, 'high_vol': 0.3})
             
-        # Calculate regime indicators
-        recent_data = self.historical_data.tail(window)
-        vol_level = recent_data['historical_vol'].mean()
-        vol_of_vol = recent_data['historical_vol'].std()
+        # Calculate regime indicators with improved stability
+        recent_data = self.historical_data.tail(window).copy()
+        if len(recent_data) < window/2:  # Require at least half window
+            raise ValueError(f"Insufficient historical data for regime detection. Need at least {window/2} points.")
+            
+        # Calculate vol level with outlier removal
+        vol_series = recent_data['historical_vol']
+        vol_level = self._robust_mean(vol_series)
+        vol_of_vol = self._robust_std(vol_series)
         
-        # Classify regime
-        if vol_level < 0.15:  # Low vol regime
-            regime_type = 'low_vol'
-        elif vol_level > 0.30:  # High vol regime
-            regime_type = 'high_vol'
-        else:
-            regime_type = 'normal_vol'
+        # Improved regime classification with hysteresis
+        prev_regime = getattr(self, '_prev_regime', 'normal')
+        regime_type = self._classify_regime_with_hysteresis(
+            vol_level, prev_regime)
         
-        # Calculate metrics
+        # Store for next detection
+        self._prev_regime = regime_type
+        
+        # Calculate metrics with improved stability
         metrics = {
-            'vol_level': vol_level,
-            'vol_of_vol': vol_of_vol,
-            'term_slope': self.vol_term_structure()['term_slope']
+            'vol_level': float(vol_level),
+            'vol_of_vol': float(vol_of_vol),
+            'term_slope': self._calculate_term_slope(),
+            'regime_stability': self._calculate_regime_stability(window)
         }
         
         # Calculate transition probabilities
         transition_probs = self._calculate_regime_transitions(regime_type)
         
         return VolatilityRegime(regime_type, metrics, transition_probs)
+
+    def _robust_mean(self, series: pd.Series) -> float:
+        """Calculate mean with outlier removal"""
+        q1, q3 = series.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        mask = (series >= q1 - 1.5*iqr) & (series <= q3 + 1.5*iqr)
+        return series[mask].mean()
+
+    def _robust_std(self, series: pd.Series) -> float:
+        """Calculate standard deviation with outlier removal"""
+        q1, q3 = series.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        mask = (series >= q1 - 1.5*iqr) & (series <= q3 + 1.5*iqr)
+        return series[mask].std()
+
+    def _classify_regime_with_hysteresis(self, vol_level: float, prev_regime: str) -> str:
+        """
+        Classify regime with hysteresis to prevent rapid switching
+        """
+        # Base thresholds
+        LOW_THRESHOLD = 0.15
+        HIGH_THRESHOLD = 0.30
+        
+        # Hysteresis bands
+        HYSTERESIS = 0.02
+        
+        if prev_regime == 'low_vol':
+            low_threshold = LOW_THRESHOLD + HYSTERESIS
+            high_threshold = HIGH_THRESHOLD
+        elif prev_regime == 'high_vol':
+            low_threshold = LOW_THRESHOLD
+            high_threshold = HIGH_THRESHOLD - HYSTERESIS
+        else:  # normal
+            low_threshold = LOW_THRESHOLD
+            high_threshold = HIGH_THRESHOLD
+            
+        if vol_level < low_threshold:
+            return 'low_vol'
+        elif vol_level > high_threshold:
+            return 'high_vol'
+        else:
+            return 'normal'
+
+    def _calculate_term_slope(self) -> float:
+        """Calculate volatility term structure slope with improved stability"""
+        try:
+            # Get ATM volatilities for each expiry
+            expiries = sorted(self.market_data['expiry'].unique())
+            if len(expiries) < 2:
+                return 0.0
+            
+            atm_vols = []
+            for expiry in expiries:
+                slice_data = self.market_data[self.market_data['expiry'] == expiry]
+                atm_idx = np.argmin(np.abs(slice_data['strike'] - self.spot_price))
+                atm_vols.append(slice_data['implied_vol'].iloc[atm_idx])
+            
+            # Calculate slope using robust method
+            slope, _ = np.polyfit(expiries, atm_vols, 1)
+            return slope
+            
+        except Exception as e:
+            warnings.warn(f"Term slope calculation failed: {str(e)}")
+            return 0.0
+
+    def _calculate_regime_stability(self, window: int) -> float:
+        """Calculate regime stability metric"""
+        if self.historical_data is None or len(self.historical_data) < window:
+            return 0.0
+        
+        # Calculate rolling volatility of volatility
+        rolling_vol = self.historical_data['historical_vol'].rolling(window=window).std()
+        
+        # Normalize and invert (higher stability = lower vol of vol)
+        stability = 1.0 / (1.0 + rolling_vol.mean())
+        
+        return np.clip(stability, 0.0, 1.0)
+
+    def _historical_vol_forecast(self, horizon: int) -> float:
+        """
+        Generate volatility forecast with improved stability
+        """
+        if self.historical_data is None:
+            # Fallback to implied vol if available
+            if 'implied_vol' in self.market_data.columns:
+                return float(self.market_data['implied_vol'].mean())
+            return 0.2  # Default reasonable volatility
+        
+        try:
+            # Calculate returns with proper handling of missing data
+            prices = self.historical_data['price'].dropna()
+            if len(prices) < 2:
+                return 0.2  # Default if insufficient data
+                
+            returns = np.log(prices).diff().dropna()
+            
+            # Try GARCH approach first
+            if self._validate_garch_data(returns):
+                try:
+                    forecast = self._garch_forecast(returns, horizon)
+                    if np.isfinite(forecast) and forecast > 0:
+                        return float(forecast)
+                except Exception as e:
+                    warnings.warn(f"GARCH forecast failed: {str(e)}")
+            
+            # Fallback to simple volatility approach
+            return self._simple_vol_forecast(returns)
+            
+        except Exception as e:
+            warnings.warn(f"Historical volatility forecast failed: {str(e)}")
+            return 0.2  # Default reasonable volatility
+
+    def _garch_forecast(self, returns: pd.Series, horizon: int) -> float:
+        """
+        Generate GARCH forecast with improved stability
+        """
+        # Scale returns for numerical stability
+        scale_factor = 100
+        returns_scaled = returns * scale_factor
+        
+        try:
+            # Fit GARCH model with robust parameters
+            model = arch_model(
+                returns_scaled,
+                vol='Garch',
+                p=1, q=1,
+                dist='skewt',
+                rescale=True
+            )
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = model.fit(
+                    disp='off',
+                    show_warning=False,
+                    options={'maxiter': 100}
+                )
+            
+            # Generate forecast
+            forecast = result.forecast(horizon=horizon)
+            variance_forecast = forecast.variance.mean()
+            
+            # Unscale and annualize
+            vol_forecast = np.sqrt(variance_forecast) / scale_factor * np.sqrt(252)
+            
+            # Apply sanity bounds
+            return np.clip(vol_forecast, 0.01, 2.0)
+            
+        except Exception as e:
+            raise RuntimeError(f"GARCH estimation failed: {str(e)}")
+
+    def _simple_vol_forecast(self, returns: pd.Series) -> float:
+        """
+        Generate simple volatility forecast with improved stability
+        """
+        # Use exponentially weighted volatility
+        lambda_param = 0.94  # Standard RiskMetrics decay
+        
+        weighted_vol = np.sqrt(
+            returns.ewm(alpha=1-lambda_param)
+            .var(bias=True)
+        ) * np.sqrt(252)
+        
+        # Take recent average for stability
+        recent_vol = float(weighted_vol.tail(30).mean())
+        
+        # Apply reasonable bounds
+        return np.clip(recent_vol, 0.01, 2.0)
+
+    def _validate_garch_data(self, returns: pd.Series) -> bool:
+        """
+        Validate data sufficiency for GARCH modeling with improved checks
+        """
+        if not isinstance(returns, (pd.Series, np.ndarray)):
+            return False
+            
+        # Convert to pandas Series if numpy array
+        if isinstance(returns, np.ndarray):
+            returns = pd.Series(returns)
+            
+        # Check basic requirements
+        if len(returns) < 252:  # Need at least 1 year of data
+            return False
+            
+        # Check for data quality
+        if returns.isnull().sum() > len(returns) * 0.05:  # Max 5% missing
+            return False
+            
+        # Check for numerical stability
+        if returns.std() < 1e-8 or not np.isfinite(returns.std()):
+            return False
+            
+        # Check for minimum volatility
+        rolling_std = returns.rolling(window=21).std()
+        if rolling_std.min() < 1e-6:
+            return False
+            
+        return True
 
     def forecast_volatility(self, horizon: int = 30, 
                           method: str = 'ensemble') -> Dict[str, float]:
@@ -304,15 +526,18 @@ class VolatilityAnalyzer:
             weights['regime'] * regime_forecast
         )
         
+        if isinstance(ensemble_forecast, pd.Series):
+            ensemble_forecast = ensemble_forecast.mean()
+        
         confidence_intervals = self._calculate_forecast_intervals(ensemble_forecast)
         
         return {
-            'point_forecast': ensemble_forecast,
+            'point_forecast': float(ensemble_forecast),
             'confidence_intervals': confidence_intervals,
             'decomposition': {
-                'historical_component': hist_forecast,
-                'implied_component': implied_forecast,
-                'regime_component': regime_forecast
+                'historical_component': float(hist_forecast),
+                'implied_component': float(implied_forecast),
+                'regime_component': float(regime_forecast)
             },
             'weights': weights,
             'diagnostics': self._calculate_forecast_diagnostics()
@@ -580,58 +805,9 @@ class VolatilityAnalyzer:
             }
         }
 
-    def _historical_vol_forecast(self, horizon: int) -> float:
-        """
-        Generate volatility forecast based on historical patterns
-        
-        Methodology:
-        1. GARCH(1,1) Base Model:
-           σ²(t) = ω + α*r²(t-1) + β*σ²(t-1)
-           - Captures volatility clustering
-           - Mean reversion characteristics
-           - Asymmetric shock response
-        
-        2. Adjustments:
-           - Long-term mean reversion factor
-           - Volatility risk premium correction
-           - Regime-specific scaling
-        
-        Args:
-            horizon: Forecast horizon in trading days
-        
-        Returns:
-            float: Annualized volatility forecast
-        """
-        returns = np.log(self.historical_data['price']).diff().dropna()
-        
-        # Fit GARCH model with asymmetric effects
-        model = arch_model(returns, vol='Garch', p=1, q=1, dist='skewt')
-        results = model.fit(disp='off')
-        
-        # Generate forecast with confidence intervals
-        forecast = results.forecast(horizon=horizon)
-        base_forecast = np.sqrt(forecast.variance.mean()) * np.sqrt(252)
-        
-        # Apply regime-specific adjustments
-        current_regime = self.detect_volatility_regime()
-        regime_adjustment = self._get_regime_adjustment(current_regime)
-        
-        return base_forecast * regime_adjustment
-
     def _implied_vol_forecast(self, horizon: int) -> float:
         """
         Forward-looking volatility forecast using options market data
-        
-        Methodology:
-        1. Forward Variance Extraction:
-           - Strip variance swaps construction
-           - Calendar spread analysis
-           - Risk-neutral density estimation
-        
-        2. Risk Premium Adjustment:
-           - Historical variance risk premium
-           - Term structure adjustment
-           - Skew impact consideration
         
         Args:
             horizon: Forecast horizon in trading days
@@ -645,6 +821,10 @@ class VolatilityAnalyzer:
             (self.market_data['expiry'] <= horizon/252 * 1.5)
         ]
         
+        if len(relevant_expiries) == 0:
+            # Fallback to all available expiries if no relevant ones found
+            return self.market_data['implied_vol'].mean()
+        
         # Calculate forward variance using variance swap replication
         forward_var = self._extract_forward_variance(relevant_expiries)
         
@@ -657,23 +837,6 @@ class VolatilityAnalyzer:
     def _regime_based_forecast(self, horizon: int) -> float:
         """
         Generate volatility forecast conditioned on current market regime
-        
-        Methodology:
-        1. Regime Characteristics:
-           - Typical volatility levels
-           - Mean reversion rates
-           - Shock persistence
-        
-        2. Transition Dynamics:
-           - Regime duration analysis
-           - Transition probabilities
-           - Conditional forecasting
-        
-        Args:
-            horizon: Forecast horizon in trading days
-        
-        Returns:
-            float: Regime-adjusted volatility forecast
         """
         current_regime = self.detect_volatility_regime()
         
@@ -684,7 +847,7 @@ class VolatilityAnalyzer:
                 'persistence': 0.95,
                 'mean_reversion': 0.05
             },
-            'normal_vol': {
+            'normal': {
                 'mean_level': 0.20,
                 'persistence': 0.90,
                 'mean_reversion': 0.10
@@ -697,13 +860,19 @@ class VolatilityAnalyzer:
         }
         
         params = regime_params[current_regime.regime_type]
+        
+        # Handle case when historical data is not available
+        if self.historical_data is None:
+            return params['mean_level']
+            
         current_vol = self.historical_data['historical_vol'].iloc[-1]
         
         # Mean-reverting forecast with regime characteristics
         forecast = (params['mean_level'] * (1 - params['persistence']**horizon) +
                    current_vol * params['persistence']**horizon)
         
-        return forecast
+        # Apply reasonable bounds
+        return np.clip(forecast, 0.01, 2.0)
 
     def _calculate_forecast_intervals(self, point_forecast: float) -> Dict[str, float]:
         """
@@ -929,7 +1098,7 @@ class VolatilityAnalyzer:
         """Implement regime-specific volatility adjustments"""
         adjustment_map = {
             'low_vol': 1.1,    # Slight upward adjustment
-            'normal_vol': 1.0,  # No adjustment
+            'normal': 1.0,  # No adjustment
             'high_vol': 0.9    # Slight downward adjustment
         }
         return adjustment_map.get(regime.regime_type, 1.0)
@@ -938,18 +1107,15 @@ class VolatilityAnalyzer:
         """
         Extract forward variance from option prices using variance swap replication
         
-        Methodology:
-        1. Variance Swap Replication:
-           - Log contract decomposition
-           - Strike integration
-           - Put-call parity adjustment
-        
         Args:
             options_data: DataFrame with option prices and strikes
         
         Returns:
             float: Forward variance rate
         """
+        if len(options_data) == 0:
+            return self.market_data['implied_vol'].mean() ** 2
+            
         # Sort by strike price
         options_data = options_data.sort_values('strike')
         
@@ -960,6 +1126,9 @@ class VolatilityAnalyzer:
         
         # Calculate weights for discrete integration
         strikes = options_data['strike'].values
+        if len(strikes) < 2:
+            return options_data['implied_vol'].iloc[0] ** 2
+            
         dk = np.diff(strikes)
         weights = 2/strikes[1:] * dk
         
@@ -982,7 +1151,7 @@ class VolatilityAnalyzer:
         # Integrate to get variance
         var = np.sum(weights * otm_prices[1:])
         
-        return var * 2/t
+        return max(var * 2/t, 0.01)  # Ensure positive variance
 
     def _calculate_variance_risk_premium(self) -> float:
         """
@@ -1228,6 +1397,112 @@ class VolatilityAnalyzer:
             'max_error': max_error,
             'r_squared': 1 - np.var(fitted_vols - actual_vols) / np.var(actual_vols)
         }
+
+    def _validate_surface_dimensions(self, strikes: np.ndarray, 
+                                   expiries: np.ndarray, 
+                                   implied_vols: np.ndarray) -> None:
+        """
+        Validate dimensions of volatility surface components
+        
+        Args:
+            strikes: Array of strike prices
+            expiries: Array of expiration dates
+            implied_vols: 2D array of implied volatilities
+        
+        Raises:
+            ValueError: If dimensions are inconsistent or insufficient data
+        """
+        expected_shape = (len(strikes), len(expiries))
+        
+        if len(strikes) < 3 or len(expiries) < 2:
+            raise ValueError(
+                f"Insufficient data points. Need at least 3 strikes and 2 expiries. "
+                f"Got {len(strikes)} strikes and {len(expiries)} expiries."
+            )
+        
+        if implied_vols.shape != expected_shape:
+            raise ValueError(
+                f"Surface shape mismatch. Expected {expected_shape}, "
+                f"got {implied_vols.shape}"
+            )
+        
+        if np.any(np.isnan(implied_vols)):
+            raise ValueError("Surface contains NaN values")
+
+    def _stabilize_surface_calculation(self, implied_vols: np.ndarray, 
+                                     min_vol: float = 0.001,
+                                     max_vol: float = 5.0) -> np.ndarray:
+        """
+        Apply numerical stability adjustments to volatility surface
+        
+        Methodology:
+        1. Bound volatilities within reasonable ranges
+        2. Handle extreme strikes and expiries
+        3. Ensure no-arbitrage conditions
+        
+        Args:
+            implied_vols: Raw implied volatility surface
+            min_vol: Minimum allowed volatility
+            max_vol: Maximum allowed volatility
+        
+        Returns:
+            np.ndarray: Stabilized volatility surface
+        """
+        # Bound volatilities
+        bounded_vols = np.clip(implied_vols, min_vol, max_vol)
+        
+        # Ensure monotonicity in time (no calendar arbitrage)
+        for i in range(bounded_vols.shape[1]-1):
+            calendar_spread = bounded_vols[:, i+1] - bounded_vols[:, i]
+            if np.any(calendar_spread < 0):
+                bounded_vols[:, i+1] = np.maximum(
+                    bounded_vols[:, i+1],
+                    bounded_vols[:, i]
+                )
+        
+        # Ensure convexity in strikes (no butterfly arbitrage)
+        for i in range(1, bounded_vols.shape[0]-1):
+            butterfly = (bounded_vols[i+1, :] + bounded_vols[i-1, :]) / 2 - bounded_vols[i, :]
+            if np.any(butterfly < 0):
+                bounded_vols[i, :] = np.minimum(
+                    bounded_vols[i, :],
+                    (bounded_vols[i+1, :] + bounded_vols[i-1, :]) / 2
+                )
+        
+        return bounded_vols
+
+    def _compute_historical_forecast_errors(self) -> np.ndarray:
+        """
+        Compute historical forecast errors for confidence interval estimation
+        
+        Returns:
+            np.ndarray: Array of historical forecast errors
+        """
+        if self.historical_data is None:
+            # Return reasonable default errors if no historical data
+            return np.array([0.1, 0.2, 0.3])  # Conservative estimate
+            
+        try:
+            # Calculate rolling forecasts and actual volatilities
+            window = 63  # ~3 months
+            rolling_forecasts = self.historical_data['historical_vol'].rolling(window).mean()
+            actual_vols = self.historical_data['historical_vol']
+            
+            # Calculate relative forecast errors
+            forecast_errors = (actual_vols[window:] / rolling_forecasts[window:] - 1.0).dropna()
+            
+            if len(forecast_errors) == 0:
+                return np.array([0.1, 0.2, 0.3])  # Conservative estimate
+                
+            # Winsorize extreme errors
+            lower, upper = np.percentile(forecast_errors, [1, 99])
+            forecast_errors = np.clip(forecast_errors, lower, upper)
+            
+            return forecast_errors.values
+            
+        except Exception as e:
+            warnings.warn(f"Error computing forecast errors: {str(e)}")
+            return np.array([0.1, 0.2, 0.3])  # Conservative estimate
 
     # Additional helper methods...
 
