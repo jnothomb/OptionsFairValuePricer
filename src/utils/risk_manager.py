@@ -1,9 +1,25 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
+import warnings
+import datetime
 from .volatility import VolatilityAnalyzer
 from scipy.stats import norm  # For VaR calculations
+
+@dataclass
+class Portfolio:
+    """Container for portfolio data"""
+    positions: List[Any]
+
+@dataclass
+class MarketData:
+    """Container for market data"""
+    spot_price: float
+    risk_free_rate: float
+    dividend_yield: float
+    volatility_surface: Any
+    timestamp: Optional[datetime.datetime] = None
 
 @dataclass
 class RiskMetrics:
@@ -17,6 +33,16 @@ class RiskMetrics:
     vanna: float  # Delta-vol correlation
     charm: float  # Delta decay
     veta: float   # Vega decay
+
+@dataclass
+class RiskThresholds:
+    """Risk threshold configuration"""
+    max_position_delta: float
+    max_position_gamma: float
+    max_position_vega: float
+    max_position_theta: float
+    max_position_size: float
+    max_loss_threshold: float
 
 class RiskManager:
     """
@@ -161,7 +187,13 @@ class RiskManager:
         return pd.DataFrame(results)
     
     def _calculate_position_greeks(self, position: pd.Series) -> RiskMetrics:
-        """Calculate Greeks for individual position"""
+        """
+        Calculate Greeks for individual position using Black-Scholes model
+        
+        Gamma is naturally positive for both calls and puts because:
+        Gamma = N'(d1)/(S*σ*√T)
+        where N'(d1) is the standard normal PDF (always positive)
+        """
         K = position['strike']
         T = position['expiry']
         sigma = self.vol_analyzer._interpolate_vol(
@@ -174,14 +206,33 @@ class RiskManager:
         d2 = d1 - sigma*np.sqrt(T)
         
         # Standard Greeks
-        delta = norm.cdf(d1)
+        is_call = position['option_type'].lower() == 'call'
+        
+        # Delta: different for calls and puts
+        if is_call:
+            delta = norm.cdf(d1)
+        else:
+            delta = norm.cdf(d1) - 1
+            
+        # Gamma: same for calls and puts, naturally positive
         gamma = norm.pdf(d1) / (self.spot_price * sigma * np.sqrt(T))
+        
+        # Vega: same for calls and puts
         vega = self.spot_price * np.sqrt(T) * norm.pdf(d1)
-        theta = (-self.spot_price * norm.pdf(d1) * sigma / 
-                (2*np.sqrt(T)) - 
-                self.risk_free_rate * K * np.exp(-self.risk_free_rate*T) * 
-                norm.cdf(d2))
-        rho = K * T * np.exp(-self.risk_free_rate*T) * norm.cdf(d2)
+        
+        # Theta: different for calls and puts
+        base_theta = (-self.spot_price * norm.pdf(d1) * sigma / 
+                     (2*np.sqrt(T)))
+        if is_call:
+            theta = base_theta - self.risk_free_rate * K * np.exp(-self.risk_free_rate*T) * norm.cdf(d2)
+        else:
+            theta = base_theta + self.risk_free_rate * K * np.exp(-self.risk_free_rate*T) * norm.cdf(-d2)
+        
+        # Rho: different for calls and puts
+        if is_call:
+            rho = K * T * np.exp(-self.risk_free_rate*T) * norm.cdf(d2)
+        else:
+            rho = -K * T * np.exp(-self.risk_free_rate*T) * norm.cdf(-d2)
         
         # Higher-order Greeks
         volga = vega * d1 * d2 / sigma
@@ -192,21 +243,18 @@ class RiskManager:
             (1 + d1*d2)/(2*T)
         )
         
-        if position['option_type'].lower() == 'put':
-            delta = delta - 1
-            theta = theta + self.risk_free_rate * K * np.exp(-self.risk_free_rate*T)
-            rho = -rho
-        
+        # Apply position size (this can make gamma negative for short positions)
+        size = position['position']
         return RiskMetrics(
-            delta=delta,
-            gamma=gamma,
-            vega=vega,
-            theta=theta,
-            rho=rho,
-            volga=volga,
-            vanna=vanna,
-            charm=charm,
-            veta=veta
+            delta=delta * size,
+            gamma=gamma * size,
+            vega=vega * size,
+            theta=theta * size,
+            rho=rho * size,
+            volga=volga * size,
+            vanna=vanna * size,
+            charm=charm * size,
+            veta=veta * size
         )
     
     def calculate_expected_shortfall(self, confidence: float = 0.99, horizon: int = 1) -> float:
@@ -455,3 +503,227 @@ class RiskManager:
             'margin_requirements': margin_reqs,
             'hedge_recommendations': hedge_recs
         }
+    
+    def _validate_portfolio(self, portfolio: Portfolio) -> None:
+        """
+        Validate portfolio structure while preserving market opportunities
+        
+        Data Integrity Checks:
+        1. Portfolio structure and completeness
+        2. Data types and formats
+        3. Basic consistency
+        
+        Market Opportunity Detection:
+        1. Unusual position sizes
+        2. Concentrated exposures
+        3. Arbitrage opportunities
+        """
+        if not portfolio.positions:
+            raise ValueError("Portfolio cannot be empty")
+            
+        # Data Integrity Checks
+        for position in portfolio.positions:
+            if not hasattr(position, 'quantity'):
+                raise ValueError("Position missing quantity attribute")
+            if not hasattr(position, 'instrument'):
+                raise ValueError("Position missing instrument attribute")
+                
+            # Validate instrument attributes
+            instrument = position.instrument
+            required_attrs = ['strike', 'expiry', 'option_type']
+            missing_attrs = [attr for attr in required_attrs 
+                           if not hasattr(instrument, attr)]
+            if missing_attrs:
+                raise ValueError(
+                    f"Instrument missing required attributes: {missing_attrs}"
+                )
+            
+            # Type validation
+            if not isinstance(position.quantity, (int, float)):
+                raise ValueError("Position quantity must be numeric")
+                
+            if not isinstance(instrument.strike, (int, float)):
+                raise ValueError("Strike price must be numeric")
+                
+            if not isinstance(instrument.expiry, (int, float)):
+                raise ValueError("Expiry must be numeric")
+                
+            if instrument.option_type.lower() not in ['call', 'put']:
+                raise ValueError(
+                    f"Invalid option type: {instrument.option_type}. "
+                    "Must be 'call' or 'put'"
+                )
+                
+        # Market Opportunity Detection
+        total_value = sum(abs(p.quantity * p.instrument.strike) 
+                         for p in portfolio.positions)
+        position_values = [
+            (p, abs(p.quantity * p.instrument.strike)) 
+            for p in portfolio.positions
+        ]
+        
+        for position, value in position_values:
+            if value > total_value * 0.2:  # 20% concentration
+                warnings.warn(
+                    f"Large position detected: {value/total_value:.1%} of portfolio\n"
+                    f"Strike: {position.instrument.strike}, "
+                    f"Type: {position.instrument.option_type}"
+                )
+                
+        # Check for potential arbitrage opportunities
+        calls = [p for p in portfolio.positions 
+                if p.instrument.option_type.lower() == 'call']
+        puts = [p for p in portfolio.positions 
+               if p.instrument.option_type.lower() == 'put']
+        
+        # Check put-call parity opportunities
+        for call in calls:
+            matching_puts = [
+                p for p in puts 
+                if abs(p.instrument.strike - call.instrument.strike) < 0.01 and
+                abs(p.instrument.expiry - call.instrument.expiry) < 0.01
+            ]
+            
+            if matching_puts:
+                warnings.warn(
+                    f"Potential put-call parity opportunity:\n"
+                    f"Call: Strike={call.instrument.strike}, "
+                    f"Expiry={call.instrument.expiry}\n"
+                    f"Put: Strike={matching_puts[0].instrument.strike}, "
+                    f"Expiry={matching_puts[0].instrument.expiry}"
+                )
+                
+    def _validate_risk_limits(self, risk_limits: Dict[str, float]) -> None:
+        """
+        Validate risk limits while preserving trading flexibility
+        
+        Data Integrity Checks:
+        1. Required limits presence
+        2. Data types
+        3. Basic consistency
+        
+        Risk Management Insights:
+        1. Unusual limit levels
+        2. Risk concentration
+        3. Hedging opportunities
+        """
+        required_limits = [
+            'max_position_size',
+            'max_portfolio_delta',
+            'max_portfolio_gamma',
+            'max_portfolio_vega',
+            'max_portfolio_theta',
+            'max_portfolio_rho'
+        ]
+        
+        # Check required limits
+        missing_limits = [limit for limit in required_limits 
+                         if limit not in risk_limits]
+        if missing_limits:
+            raise ValueError(f"Missing required risk limits: {missing_limits}")
+            
+        # Type validation
+        for limit_name, limit_value in risk_limits.items():
+            if not isinstance(limit_value, (int, float)):
+                raise ValueError(f"Risk limit {limit_name} must be numeric")
+                
+        # Risk Management Insights
+        typical_limits = {
+            'max_position_size': 0.2,  # 20% of portfolio
+            'max_portfolio_delta': 0.3,  # 30% of portfolio
+            'max_portfolio_gamma': 0.1,  # 10% of portfolio
+            'max_portfolio_vega': 0.2,   # 20% of portfolio
+            'max_portfolio_theta': 0.05,  # 5% of portfolio
+            'max_portfolio_rho': 0.1      # 10% of portfolio
+        }
+        
+        for limit_name, typical_value in typical_limits.items():
+            if limit_name in risk_limits:
+                actual_value = abs(risk_limits[limit_name])
+                if actual_value > 2 * typical_value:
+                    warnings.warn(
+                        f"Unusually high {limit_name}: {actual_value:.1%} "
+                        f"(typical: {typical_value:.1%})"
+                    )
+                    
+        # Check for asymmetric limits
+        if ('max_long_delta' in risk_limits and 
+            'max_short_delta' in risk_limits):
+            long_delta = abs(risk_limits['max_long_delta'])
+            short_delta = abs(risk_limits['max_short_delta'])
+            
+            if max(long_delta, short_delta) > 2 * min(long_delta, short_delta):
+                warnings.warn(
+                    f"Highly asymmetric delta limits detected: "
+                    f"Long={long_delta:.1%}, Short={short_delta:.1%}"
+                )
+                
+    def _validate_market_data(self, market_data: MarketData) -> None:
+        """
+        Validate market data while preserving anomaly detection
+        
+        Data Integrity Checks:
+        1. Required data presence
+        2. Data types and formats
+        3. Basic consistency
+        
+        Market Signal Detection:
+        1. Price anomalies
+        2. Volatility patterns
+        3. Trading opportunities
+        """
+        required_data = [
+            'spot_price',
+            'risk_free_rate',
+            'dividend_yield',
+            'volatility_surface'
+        ]
+        
+        # Check required data
+        missing_data = [data for data in required_data 
+                       if not hasattr(market_data, data)]
+        if missing_data:
+            raise ValueError(f"Missing required market data: {missing_data}")
+            
+        # Type validation
+        if not isinstance(market_data.spot_price, (int, float)):
+            raise ValueError("Spot price must be numeric")
+            
+        if not isinstance(market_data.risk_free_rate, (int, float)):
+            raise ValueError("Risk-free rate must be numeric")
+            
+        if not isinstance(market_data.dividend_yield, (int, float)):
+            raise ValueError("Dividend yield must be numeric")
+            
+        # Validate volatility surface interface
+        if not hasattr(market_data.volatility_surface, 'get_implied_vol'):
+            raise ValueError(
+                "Volatility surface must implement get_implied_vol method"
+            )
+            
+        # Market Signal Detection
+        typical_conditions = {
+            'risk_free_rate': 0.03,  # 3%
+            'dividend_yield': 0.02   # 2%
+        }
+        
+        if abs(market_data.risk_free_rate) > 2 * typical_conditions['risk_free_rate']:
+            warnings.warn(
+                f"Unusual risk-free rate: {market_data.risk_free_rate:.1%} "
+                f"(typical: {typical_conditions['risk_free_rate']:.1%})"
+            )
+            
+        if market_data.dividend_yield > 2 * typical_conditions['dividend_yield']:
+            warnings.warn(
+                f"High dividend yield: {market_data.dividend_yield:.1%} "
+                f"(typical: {typical_conditions['dividend_yield']:.1%})"
+            )
+            
+        # Check data freshness if timestamp available
+        if market_data.timestamp:
+            max_age = datetime.timedelta(minutes=15)
+            if datetime.datetime.now() - market_data.timestamp > max_age:
+                warnings.warn(
+                    f"Market data is more than {max_age} old. "
+                    "Consider refreshing for time-sensitive trades."
+                )

@@ -39,6 +39,19 @@ class GreeksCalculator:
         risk_free_rate (float): Risk-free interest rate
         volatility (float): Implied volatility
         """
+        # Input validation
+        if spot_price <= 0 or strike <= 0 or time_to_expiry <= 0 or volatility <= 0:
+            raise ValueError("Spot price, strike, time to expiry, and volatility must be positive")
+        if not isinstance(risk_free_rate, (int, float)):
+            raise ValueError("Risk-free rate must be a number")
+            
+        self.spot_price = spot_price
+        self.strike = strike
+        self.time_to_expiry = time_to_expiry
+        self.risk_free_rate = risk_free_rate
+        self.volatility = volatility
+        
+        # Keep shorter names for calculations
         self.S = spot_price
         self.K = strike
         self.T = time_to_expiry
@@ -96,10 +109,23 @@ class GreeksCalculator:
         return self.S * np.sqrt(self.T) * norm.pdf(self.d1)
 
     def _calculate_rho(self, is_call: bool) -> float:
-        """Calculate Rho"""
+        """
+        Calculate Rho
+        
+        For ATM options:
+        - Call rho = K * T * e^(-rT) * N(d2)
+        - Put rho = -K * T * e^(-rT) * N(-d2)
+        
+        These should be equal in magnitude but opposite in sign for ATM options
+        due to put-call parity: c - p = S - K*e^(-rT)
+        """
         from scipy.stats import norm
-        sign = 1 if is_call else -1
-        return sign * self.K * self.T * np.exp(-self.r * self.T) * norm.cdf(sign * self.d2)
+        
+        # For ATM options, N(d2) ≈ 0.5, so call and put rho should be equal in magnitude
+        if is_call:
+            return self.K * self.T * np.exp(-self.r * self.T) * norm.cdf(self.d2)
+        else:
+            return -self.K * self.T * np.exp(-self.r * self.T) * norm.cdf(-self.d2)
 
 class PortfolioGreeks:
     def __init__(self, positions: List[Dict]):

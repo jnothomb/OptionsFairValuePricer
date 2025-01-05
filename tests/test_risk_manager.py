@@ -1,307 +1,233 @@
 import pytest
 import numpy as np
-from typing import Dict, List, Any
-from src.utils.risk_manager import RiskManager, RiskThresholds
+import pandas as pd
+from src.utils.risk_manager import RiskManager, RiskMetrics, RiskThresholds
+from src.utils.volatility import VolatilityAnalyzer
+
+@pytest.fixture
+def sample_positions():
+    """Fixture providing sample options positions"""
+    return pd.DataFrame({
+        'strike': [95.0, 100.0, 105.0],
+        'expiry': [0.25, 0.25, 0.25],
+        'position': [1.0, -2.0, 1.0],  # Long strangle, short straddle
+        'option_type': ['call', 'call', 'put']
+    })
+
+@pytest.fixture
+def sample_market_data():
+    """Fixture providing sample market data for volatility analyzer"""
+    return pd.DataFrame({
+        'strike': [95, 100, 105] * 3,
+        'expiry': [0.25, 0.25, 0.25, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0],
+        'implied_vol': [0.2, 0.18, 0.22, 0.22, 0.2, 0.24, 0.25, 0.23, 0.27],
+        'option_type': ['call'] * 9,
+        'underlying_price': [100] * 9
+    })
+
+@pytest.fixture
+def risk_manager(sample_positions, sample_market_data):
+    """Fixture providing initialized risk manager"""
+    vol_analyzer = VolatilityAnalyzer(sample_market_data)
+    return RiskManager(sample_positions, vol_analyzer)
 
 class TestRiskManager:
-    """Test suite for Risk Manager functionality"""
+    """Test suite for RiskManager class"""
 
-    @pytest.fixture
-    def risk_thresholds(self):
-        """Sample risk thresholds for testing"""
-        return RiskThresholds(
-            max_position_delta=1.0,
-            max_position_gamma=0.1,
-            max_position_vega=0.5,
-            max_position_theta=-0.2,
-            max_position_size=100000,
-            max_loss_threshold=5000
-        )
-
-    @pytest.fixture
-    def sample_position(self):
-        """Sample position data for testing"""
-        return {
-            'type': 'call',
-            'quantity': 10,
-            'strike': 100,
-            'expiry': '2024-12-31',
-            'underlying_price': 100,
-            'option_price': 5.0,
-            'implied_vol': 0.2
-        }
-
-    @pytest.fixture
-    def risk_manager(self, risk_thresholds):
-        """Initialize RiskManager with thresholds"""
-        return RiskManager(risk_thresholds)
-
-    def test_risk_manager_initialization(self, risk_manager, risk_thresholds):
+    def test_initialization(self, sample_positions, sample_market_data):
         """Test proper initialization of RiskManager"""
-        assert risk_manager.thresholds == risk_thresholds
-        assert isinstance(risk_manager.positions, list)
-        assert isinstance(risk_manager.risk_metrics, dict)
-
-    def test_add_position(self, risk_manager, sample_position):
-        """Test adding a new position"""
-        position_id = risk_manager.add_position(sample_position)
-        assert len(risk_manager.positions) == 1
-        assert risk_manager.positions[0]['id'] == position_id
-        assert risk_manager.positions[0]['type'] == 'call'
-
-    def test_remove_position(self, risk_manager, sample_position):
-        """Test removing a position"""
-        position_id = risk_manager.add_position(sample_position)
-        risk_manager.remove_position(position_id)
-        assert len(risk_manager.positions) == 0
-
-    def test_position_risk_calculation(self, risk_manager, sample_position):
-        """Test calculation of position risk metrics"""
-        position_id = risk_manager.add_position(sample_position)
-        risk_metrics = risk_manager.calculate_position_risk(position_id)
+        vol_analyzer = VolatilityAnalyzer(sample_market_data)
+        manager = RiskManager(sample_positions, vol_analyzer)
         
-        assert isinstance(risk_metrics, dict)
-        assert 'delta' in risk_metrics
-        assert 'gamma' in risk_metrics
-        assert 'theta' in risk_metrics
-        assert 'vega' in risk_metrics
+        assert manager.spot_price == 100.0
+        assert len(manager.positions) == 3
+        assert manager.risk_free_rate == pytest.approx(0.02)
 
-    def test_portfolio_risk_calculation(self, risk_manager):
-        """Test calculation of portfolio-wide risk metrics"""
-        # Add multiple positions
-        positions = [
-            {
-                'type': 'call',
-                'quantity': 10,
-                'strike': 100,
-                'expiry': '2024-12-31',
-                'underlying_price': 100,
-                'option_price': 5.0,
-                'implied_vol': 0.2
-            },
-            {
-                'type': 'put',
-                'quantity': -5,
-                'strike': 95,
-                'expiry': '2024-12-31',
-                'underlying_price': 100,
-                'option_price': 3.0,
-                'implied_vol': 0.25
-            }
+    def test_invalid_initialization(self):
+        """Test initialization with invalid data"""
+        vol_analyzer = VolatilityAnalyzer(pd.DataFrame({
+            'strike': [100],
+            'expiry': [0.5],
+            'implied_vol': [0.2],
+            'option_type': ['call'],
+            'underlying_price': [100]
+        }))
+        
+        invalid_positions = pd.DataFrame({
+            'strike': [100],  # Missing required columns
+            'expiry': [0.5]
+        })
+        
+        with pytest.raises(ValueError, match="missing required columns"):
+            RiskManager(invalid_positions, vol_analyzer)
+
+    def test_portfolio_greeks(self, risk_manager):
+        """Test portfolio Greeks calculation"""
+        greeks = risk_manager.calculate_portfolio_greeks()
+        
+        assert isinstance(greeks, RiskMetrics)
+        
+        # Test individual position deltas (should be naturally bounded)
+        for _, pos in risk_manager.positions.iterrows():
+            single_pos_greeks = risk_manager._calculate_position_greeks(pos)
+            base_delta = single_pos_greeks.delta / pos['position']  # Remove position effect
+            if pos['option_type'].lower() == 'call':
+                assert 0 <= base_delta <= 1  # Call delta naturally bounded [0,1]
+            else:
+                assert -1 <= base_delta <= 0  # Put delta naturally bounded [-1,0]
+        
+        # Test individual position gamma (should be positive)
+        for _, pos in risk_manager.positions.iterrows():
+            single_pos_greeks = risk_manager._calculate_position_greeks(pos)
+            base_gamma = single_pos_greeks.gamma / pos['position']  # Remove position effect
+            assert base_gamma > 0  # Base gamma should be positive
+            
+        # Portfolio Greeks can take any real value
+        assert isinstance(greeks.delta, float)
+        assert isinstance(greeks.gamma, float)
+        assert isinstance(greeks.vega, float)
+        assert isinstance(greeks.theta, float)
+        assert isinstance(greeks.rho, float)
+        assert np.isfinite(greeks.delta)
+        assert np.isfinite(greeks.gamma)
+        assert np.isfinite(greeks.vega)
+        assert np.isfinite(greeks.theta)
+        assert np.isfinite(greeks.rho)
+
+    def test_value_at_risk(self, risk_manager):
+        """Test VaR calculation"""
+        var_99 = risk_manager.calculate_var(confidence=0.99)
+        var_95 = risk_manager.calculate_var(confidence=0.95)
+        
+        assert var_99 > var_95  # Higher confidence = larger VaR
+        assert isinstance(var_99, float)
+        assert var_99 > 0  # VaR should be positive for long options
+
+    def test_expected_shortfall(self, risk_manager):
+        """Test Expected Shortfall calculation"""
+        es_99 = risk_manager.calculate_expected_shortfall(confidence=0.99)
+        var_99 = risk_manager.calculate_var(confidence=0.99)
+        
+        assert es_99 > var_99  # ES should be larger than VaR
+        assert isinstance(es_99, float)
+        assert es_99 > 0
+
+    def test_hedge_recommendations(self, risk_manager):
+        """Test hedging recommendations"""
+        recommendations = risk_manager.generate_hedge_recommendations()
+        
+        assert isinstance(recommendations, dict)
+        assert all(key in recommendations for key in ['delta_hedge', 'vega_hedge', 'gamma_hedge'])
+        assert all(isinstance(v, float) for v in recommendations.values())
+
+    def test_scenario_analysis(self, risk_manager):
+        """Test scenario analysis"""
+        spot_changes = [-0.1, 0.0, 0.1]
+        vol_changes = [-0.2, 0.0, 0.2]
+        
+        results = risk_manager.run_scenario_analysis(spot_changes, vol_changes)
+        
+        assert isinstance(results, pd.DataFrame)
+        assert len(results) == len(spot_changes) * len(vol_changes)
+        assert all(col in results.columns for col in ['spot_change', 'vol_change', 'pnl_estimate'])
+
+    def test_risk_limits(self, risk_manager):
+        """Test risk limits monitoring"""
+        # Use large limits to test that portfolio Greeks aren't artificially constrained
+        limits = {
+            'delta': 1000.0,  # Can be exceeded by large positions
+            'vega': 10000.0,
+            'var_99': 1000000.0
+        }
+        
+        breaches = risk_manager.check_risk_limits(limits)
+        
+        assert isinstance(breaches, dict)
+        assert all(isinstance(v, bool) for v in breaches.values())
+        assert all(key in breaches for key in limits.keys())
+
+    def test_stress_testing(self, risk_manager):
+        """Test stress testing functionality"""
+        scenarios = [
+            {'spot_shock': 0.1, 'vol_shock': 0.2, 'rate_shock': 50},
+            {'spot_shock': -0.1, 'vol_shock': -0.2, 'rate_shock': -50}
         ]
         
-        for position in positions:
-            risk_manager.add_position(position)
+        results = risk_manager.calculate_stress_test(scenarios)
         
-        portfolio_risk = risk_manager.calculate_portfolio_risk()
-        
-        assert 'total_delta' in portfolio_risk
-        assert 'total_gamma' in portfolio_risk
-        assert 'total_theta' in portfolio_risk
-        assert 'total_vega' in portfolio_risk
-        assert 'total_exposure' in portfolio_risk
+        assert isinstance(results, pd.DataFrame)
+        assert len(results) == len(scenarios)
+        assert all(col in results.columns for col in 
+                  ['total_pnl', 'delta_pnl', 'gamma_pnl', 'vega_pnl', 'theta_pnl', 'rho_pnl'])
 
-    def test_risk_threshold_violations(self, risk_manager):
-        """Test detection of risk threshold violations"""
-        # Add position that exceeds delta threshold
-        large_position = {
-            'type': 'call',
-            'quantity': 100,  # Large position
-            'strike': 100,
-            'expiry': '2024-12-31',
-            'underlying_price': 100,
-            'option_price': 5.0,
-            'implied_vol': 0.2
+    def test_sensitivity_analysis(self, risk_manager):
+        """Test portfolio sensitivity analysis"""
+        shock_range = [-0.1, 0.0, 0.1]
+        
+        for greek in ['delta', 'gamma', 'vega', 'theta', 'rho']:
+            results = risk_manager.calculate_portfolio_sensitivity(greek, shock_range)
+            
+            assert isinstance(results, pd.DataFrame)
+            assert len(results) == len(shock_range)
+            assert all(col in results.columns for col in ['shock', 'pnl'])
+
+    def test_margin_requirements(self, risk_manager):
+        """Test margin requirements calculation"""
+        margin_params = {
+            'im_multiplier': 1.5,
+            'mm_ratio': 0.75
         }
         
-        position_id = risk_manager.add_position(large_position)
-        violations = risk_manager.check_risk_violations()
+        requirements = risk_manager.calculate_margin_requirements(margin_params)
         
-        assert len(violations) > 0
-        assert any('delta' in v.lower() for v in violations)
+        assert isinstance(requirements, dict)
+        assert all(key in requirements for key in 
+                  ['initial_margin', 'maintenance_margin', 'exposure_component'])
+        assert requirements['maintenance_margin'] < requirements['initial_margin']
 
-    def test_risk_adjustments(self, risk_manager, sample_position):
-        """Test suggested risk adjustments"""
-        position_id = risk_manager.add_position(sample_position)
-        adjustments = risk_manager.suggest_risk_adjustments()
-        
-        assert isinstance(adjustments, dict)
-        assert 'suggested_trades' in adjustments
-        assert 'risk_impact' in adjustments
-
-    @pytest.mark.parametrize("risk_metric,threshold", [
-        ('delta', 2.0),
-        ('gamma', 0.2),
-        ('vega', 1.0),
-        ('theta', -0.4)
-    ])
-    def test_individual_risk_thresholds(self, risk_metric, threshold):
-        """Test individual risk metric thresholds"""
-        custom_thresholds = RiskThresholds(
-            max_position_delta=2.0,
-            max_position_gamma=0.2,
-            max_position_vega=1.0,
-            max_position_theta=-0.4,
-            max_position_size=100000,
-            max_loss_threshold=5000
-        )
-        
-        risk_manager = RiskManager(custom_thresholds)
-        assert getattr(risk_manager.thresholds, f'max_position_{risk_metric}') == threshold
-
-    def test_stress_testing(self, risk_manager, sample_position):
-        """Test stress testing scenarios"""
-        position_id = risk_manager.add_position(sample_position)
-        
-        stress_scenarios = {
-            'market_crash': {'price_change': -0.2, 'vol_change': 0.5},
-            'rally': {'price_change': 0.2, 'vol_change': -0.2},
-            'vol_spike': {'price_change': 0, 'vol_change': 1.0}
-        }
-        
-        stress_results = risk_manager.run_stress_tests(stress_scenarios)
-        
-        assert isinstance(stress_results, dict)
-        assert all(scenario in stress_results for scenario in stress_scenarios)
-        assert all('pnl_impact' in result for result in stress_results.values())
-
-    def test_risk_reporting(self, risk_manager, sample_position):
-        """Test risk reporting functionality"""
-        position_id = risk_manager.add_position(sample_position)
+    def test_risk_report(self, risk_manager):
+        """Test risk report generation"""
         report = risk_manager.generate_risk_report()
         
         assert isinstance(report, dict)
-        assert 'portfolio_risk' in report
-        assert 'risk_violations' in report
-        assert 'stress_test_results' in report
-        assert 'suggested_actions' in report
+        assert all(key in report for key in 
+                  ['portfolio_greeks', 'risk_metrics', 'margin_requirements', 'hedge_recommendations'])
+        assert isinstance(report['timestamp'], pd.Timestamp)
 
-    @pytest.fixture
-    def risk_manager(self):
-        """Initialize RiskManager with sample thresholds and portfolio value."""
-        thresholds = RiskThresholds(
-            max_position_delta=1.0,
-            max_position_gamma=0.1,
-            max_position_vega=0.5,
-            max_position_theta=-0.2,
-            max_position_size=100000,
-            max_loss_threshold=5000
-        )
-        manager = RiskManager(thresholds)
-        manager.portfolio_value = 100000  # Example portfolio value
-        return manager
-
-    def test_calculate_position_size(self, risk_manager):
-        """Test position sizing calculation."""
-        account_balance = 10000
-        risk_per_trade = 200
-        entry_price = 50
-        stop_loss_price = 45
-        
-        position_size = risk_manager.calculate_position_size(account_balance, risk_per_trade, entry_price, stop_loss_price)
-        assert position_size == 40  # (200 / (50 - 45))
-
-    def test_calculate_margin_requirement(self, risk_manager):
-        """Test margin requirement calculation."""
-        position_value = 50000
-        margin_rate = 0.2
-        
-        margin_requirement = risk_manager.calculate_margin_requirement(position_value, margin_rate)
-        assert margin_requirement == 10000  # (50000 * 0.2)
-
-    def test_calculate_var(self, risk_manager):
-        """Test Value at Risk (VaR) calculation."""
-        portfolio_returns = np.array([-0.02, -0.01, 0.01, 0.03, -0.04])
-        var = risk_manager.calculate_var(portfolio_returns, confidence_level=0.95)
-        assert var == -0.04  # Expected VaR at 95% confidence level
-
-    def test_run_stress_tests(self, risk_manager):
-        """Test stress testing scenarios."""
-        risk_manager.portfolio_value = 100000  # Set portfolio value for testing
-        scenarios = {
-            'market_crash': {'price_change': -0.2},
-            'rally': {'price_change': 0.2}
-        }
-        
-        results = risk_manager.run_stress_tests(scenarios)
-        
-        assert 'market_crash' in results
-        assert 'rally' in results
-        assert results['market_crash']['simulated_value'] == 80000  # 100000 * (1 - 0.2)
-        assert results['rally']['simulated_value'] == 120000  # 100000 * (1 + 0.2)
-
-    def test_check_position_risks(self, risk_manager):
-        """Test the check_position_risks method."""
-        # Assuming you have a method to add positions to the risk manager
-        # Add a sample position for testing
-        position_id = risk_manager.add_position({
-            'type': 'call',
-            'quantity': 10,
-            'strike': 100,
-            'expiry': '2024-12-31',
-            'underlying_price': 100,
-            'option_price': 5.0,
-            'implied_vol': 0.2,
-            'delta': 0.5,  # Example delta value
-            'gamma': 0.1,  # Example gamma value
-            'theta': -0.02,  # Example theta value
-            'vega': 0.2,  # Example vega value
-            'value': 5000  # Example position value
+    def test_extreme_positions(self, sample_market_data):
+        """Test handling of extreme positions"""
+        extreme_positions = pd.DataFrame({
+            'strike': [100.0],
+            'expiry': [0.01],  # Very short dated
+            'position': [100.0],  # Large position
+            'option_type': ['call']
         })
         
-        # Define greeks and position value for the test
-        greeks = {
-            'delta': 0.5,
-            'gamma': 0.1,
-            'theta': -0.02,
-            'vega': 0.2
-        }
-        position_value = 5000  # Example position value
-
-        # Check for risks
-        risks = risk_manager.check_position_risks(greeks, position_value)
-        assert isinstance(risks, dict)  # Assuming it returns a dictionary of risks
-        assert 'delta' in risks  # Check for specific risk metrics
-
-    def add_position(self, position: Dict[str, Any]) -> int:
-        """Add a new position and return its ID."""
-        position_id = len(self.positions) + 1  # Simple ID generation
-        position['id'] = position_id  # Add ID to the position
-        # Ensure the position has necessary risk metrics
-        position['delta'] = position.get('delta', 0.0)  # Default to 0 if not provided
-        position['gamma'] = position.get('gamma', 0.0)
-        position['theta'] = position.get('theta', 0.0)
-        position['vega'] = position.get('vega', 0.0)
-        position['value'] = position.get('value', 0.0)  # Ensure value is set
-        self.positions.append(position)  # Add position to the list
-        return position_id
-
-    def calculate_position_risk(self, position_id: int) -> Dict[str, float]:
-        """Calculate risk metrics for a specific position."""
-        position = next((pos for pos in self.positions if pos['id'] == position_id), None)
-        if position is None:
-            raise ValueError("Position not found.")
+        vol_analyzer = VolatilityAnalyzer(sample_market_data)
+        manager = RiskManager(extreme_positions, vol_analyzer)
         
-        # Return the risk metrics based on the position's attributes
-        return {
-            'delta': position.get('delta', 0.0),
-            'gamma': position.get('gamma', 0.0),
-            'theta': position.get('theta', 0.0),
-            'vega': position.get('vega', 0.0)
-        }
+        # Test that calculations don't break with extreme values
+        greeks = manager.calculate_portfolio_greeks()
+        var = manager.calculate_var()
+        es = manager.calculate_expected_shortfall()
+        
+        assert np.isfinite(greeks.delta)
+        assert np.isfinite(var)
+        assert np.isfinite(es)
 
-    def check_risk_violations(self) -> List[str]:
-        """Check for risk threshold violations."""
-        violations = []
-        for position in self.positions:
-            if 'delta' in position and abs(position['delta']) > self.thresholds.max_position_delta:
-                violations.append(f"Position {position['id']} exceeds delta threshold.")
-            if 'gamma' in position and abs(position['gamma']) > self.thresholds.max_position_gamma:
-                violations.append(f"Position {position['id']} exceeds gamma threshold.")
-            if 'theta' in position and position['theta'] < self.thresholds.max_position_theta:
-                violations.append(f"Position {position['id']} exceeds theta threshold.")
-            if 'vega' in position and abs(position['vega']) > self.thresholds.max_position_vega:
-                violations.append(f"Position {position['id']} exceeds vega threshold.")
-            if 'value' in position and position['value'] > self.thresholds.max_position_size:
-                violations.append(f"Position {position['id']} exceeds position size threshold.")
-        return violations
+    def test_portfolio_aggregation(self, sample_market_data):
+        """Test portfolio aggregation with offsetting positions"""
+        offsetting_positions = pd.DataFrame({
+            'strike': [100.0, 100.0],
+            'expiry': [0.25, 0.25],
+            'position': [1.0, -1.0],  # Offsetting positions
+            'option_type': ['call', 'call']
+        })
+        
+        vol_analyzer = VolatilityAnalyzer(sample_market_data)
+        manager = RiskManager(offsetting_positions, vol_analyzer)
+        greeks = manager.calculate_portfolio_greeks()
+        
+        assert abs(greeks.delta) < 1e-10  # Should be close to zero
+        assert abs(greeks.gamma) < 1e-10
+        assert abs(greeks.vega) < 1e-10

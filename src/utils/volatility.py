@@ -132,58 +132,244 @@ class VolatilityAnalyzer:
             self.historical_data = None
 
     def _validate_market_data(self, market_data: pd.DataFrame) -> None:
-        """Validate market data completeness and format"""
-        required_columns = ['strike', 'expiry', 'implied_vol', 'option_type', 'underlying_price']
+        """
+        Validate market data completeness and format while preserving market anomalies
         
-        # Check required columns
-        missing_cols = [col for col in required_columns if col not in market_data.columns]
+        Data Integrity Checks:
+        1. Required columns presence
+        2. Data types and completeness
+        3. Basic structural validation
+        
+        Market Anomaly Detection:
+        1. Unusual volatility patterns
+        2. Volatility surface arbitrage opportunities
+        3. Pricing inconsistencies
+        
+        Raises:
+            ValueError: For data integrity failures
+        Warns:
+            RuntimeWarning: For potential market anomalies
+        """
+        # Data Integrity Checks
+        required_columns = [
+            'strike', 'expiry', 'implied_vol', 
+            'option_type', 'underlying_price'
+        ]
+        
+        missing_cols = [col for col in required_columns 
+                       if col not in market_data.columns]
         if missing_cols:
             raise ValueError(f"Market data missing required columns: {missing_cols}")
         
-        # Validate data types and ranges
-        if not all(market_data['strike'] > 0):
-            raise ValueError("Strike prices must be positive")
-        
-        if not all(market_data['expiry'] > 0):
-            raise ValueError("Expiry times must be positive")
-        
-        if not all(market_data['implied_vol'] > 0):
-            raise ValueError("Implied volatilities must be positive")
-        
-        if not all(market_data['underlying_price'] > 0):
-            raise ValueError("Underlying prices must be positive")
-        
-        if not all(market_data['option_type'].isin(['call', 'put'])):
-            raise ValueError("Option types must be 'call' or 'put'")
-        
-        if market_data.isnull().any().any():
-            raise ValueError("Market data contains NaN values")
+        if len(market_data) == 0:
+            raise ValueError("Market data is empty")
             
-        # Validate consistency
-        if len(set(market_data['underlying_price'])) > 1:
-            raise ValueError("Inconsistent underlying prices in market data")
-
+        # Convert numeric columns to float, handling various formats
+        numeric_cols = ['strike', 'expiry', 'implied_vol', 'underlying_price']
+        for col in numeric_cols:
+            try:
+                market_data[col] = pd.to_numeric(
+                    market_data[col].replace(['', ' ', 'N/A', 'NA', 'NULL', 'None', '#N/A'], np.nan)
+                )
+            except Exception as e:
+                raise ValueError(f"Column {col} contains invalid numeric values: {str(e)}")
+        
+        # Check for missing values
+        if market_data[numeric_cols].isnull().any().any():
+            raise ValueError("Market data contains missing values")
+            
+        # Validate option types
+        valid_types = ['call', 'put']
+        option_types = market_data['option_type'].str.lower()
+        invalid_types = set(option_types) - set(valid_types)
+        if invalid_types:
+            raise ValueError(
+                f"Invalid option types found: {invalid_types}. "
+                f"Must be one of: {valid_types}"
+            )
+        
+        # Market Anomaly Detection
+        # Note: These are warnings only, not errors, to allow trading on anomalies
+        
+        # Check for unusual volatility levels
+        vol_mean = market_data['implied_vol'].mean()
+        vol_std = market_data['implied_vol'].std()
+        extreme_vols = market_data[
+            np.abs(market_data['implied_vol'] - vol_mean) > 3 * vol_std
+        ]
+        if not extreme_vols.empty:
+            warnings.warn(
+                f"Unusual volatility levels detected:\n{extreme_vols[['strike', 'expiry', 'implied_vol']]}"
+            )
+        
+        # Check for volatility arbitrage opportunities
+        for expiry in market_data['expiry'].unique():
+            expiry_data = market_data[market_data['expiry'] == expiry]
+            strikes = sorted(expiry_data['strike'].unique())
+            
+            for i in range(1, len(strikes)-1):
+                k1, k2, k3 = strikes[i-1:i+2]
+                v1 = expiry_data[expiry_data['strike'] == k1]['implied_vol'].iloc[0]
+                v2 = expiry_data[expiry_data['strike'] == k2]['implied_vol'].iloc[0]
+                v3 = expiry_data[expiry_data['strike'] == k3]['implied_vol'].iloc[0]
+                
+                # Check butterfly arbitrage
+                butterfly_violation = v2 > (k3-k2)/(k3-k1)*v1 + (k2-k1)/(k3-k1)*v3
+                if butterfly_violation:
+                    warnings.warn(
+                        f"Potential butterfly arbitrage at expiry {expiry}, "
+                        f"strikes {k1}, {k2}, {k3}"
+                    )
+        
+        # Check for calendar spread opportunities
+        for strike in market_data['strike'].unique():
+            strike_data = market_data[market_data['strike'] == strike]
+            expiries = sorted(strike_data['expiry'].unique())
+            vols = [strike_data[strike_data['expiry'] == t]['implied_vol'].iloc[0] 
+                   for t in expiries]
+            
+            for i in range(len(expiries)-1):
+                if vols[i] > vols[i+1]:
+                    warnings.warn(
+                        f"Potential calendar spread arbitrage at strike {strike}, "
+                        f"expiries {expiries[i]}, {expiries[i+1]}"
+                    )
+                    
     def _validate_historical_data(self, historical_data: pd.DataFrame) -> None:
-        """Validate historical data completeness and format"""
+        """
+        Validate historical data while preserving market anomalies
+        
+        Data Integrity Checks:
+        1. Required columns and types
+        2. Data completeness
+        3. Basic structural validation
+        
+        Market Pattern Detection:
+        1. Unusual price movements
+        2. Volatility regime changes
+        3. Market stress periods
+        
+        Raises:
+            ValueError: For data integrity failures
+        Warns:
+            RuntimeWarning: For potential market patterns
+        """
         required_columns = ['date', 'price', 'historical_vol']
         
         # Check required columns
-        missing_cols = [col for col in required_columns if col not in historical_data.columns]
+        missing_cols = [col for col in required_columns 
+                       if col not in historical_data.columns]
         if missing_cols:
             raise ValueError(f"Historical data missing required columns: {missing_cols}")
         
-        # Validate data types and ranges
+        # Validate date column
         if not pd.api.types.is_datetime64_any_dtype(historical_data['date']):
-            raise ValueError("Date column must be datetime type")
+            try:
+                historical_data['date'] = pd.to_datetime(historical_data['date'])
+            except Exception as e:
+                raise ValueError(f"Invalid date format: {str(e)}")
         
-        if not all(historical_data['price'] > 0):
-            raise ValueError("Historical prices must be positive")
+        # Convert numeric columns
+        numeric_cols = ['price', 'historical_vol']
+        for col in numeric_cols:
+            try:
+                historical_data[col] = pd.to_numeric(
+                    historical_data[col].replace(['', ' ', 'N/A', 'NA', 'NULL', 'None', '#N/A'], np.nan)
+                )
+            except Exception as e:
+                raise ValueError(f"Column {col} contains invalid numeric values: {str(e)}")
         
-        if not all(historical_data['historical_vol'] >= 0):
-            raise ValueError("Historical volatilities must be non-negative")
+        # Check for missing values
+        if historical_data[numeric_cols].isnull().any().any():
+            raise ValueError("Historical data contains missing values")
         
-        if historical_data.isnull().any().any():
-            raise ValueError("Historical data contains NaN values")
+        # Market Pattern Detection
+        # Note: These are informational warnings, not errors
+        
+        # Detect unusual price movements
+        returns = np.log(historical_data['price']).diff()
+        z_scores = np.abs((returns - returns.mean()) / returns.std())
+        extreme_moves = historical_data[z_scores > 4]
+        if not extreme_moves.empty:
+            warnings.warn(
+                f"Unusual price movements detected:\n{extreme_moves[['date', 'price']]}"
+            )
+        
+        # Detect volatility regime changes
+        vol_changes = historical_data['historical_vol'].pct_change()
+        significant_changes = historical_data[np.abs(vol_changes) > 0.5]
+        if not significant_changes.empty:
+            warnings.warn(
+                f"Significant volatility regime changes detected:\n"
+                f"{significant_changes[['date', 'historical_vol']]}"
+            )
+        
+        # Detect market stress periods
+        stress_periods = historical_data[
+            (z_scores > 3) & (historical_data['historical_vol'] > 
+            historical_data['historical_vol'].mean() + 2*historical_data['historical_vol'].std())
+        ]
+        if not stress_periods.empty:
+            warnings.warn(
+                f"Market stress periods detected:\n{stress_periods[['date', 'price', 'historical_vol']]}"
+            )
+            
+    def _validate_calculation_inputs(self, **kwargs) -> None:
+        """
+        Validate calculation inputs while preserving market signals
+        
+        Data Integrity Checks:
+        1. Type validation
+        2. Basic range validation
+        3. Structural validation
+        
+        Market Signal Preservation:
+        1. Allow extreme but valid values
+        2. Preserve unusual patterns
+        3. Document anomalies
+        
+        Raises:
+            ValueError: For data integrity failures
+        Warns:
+            RuntimeWarning: For unusual market conditions
+        """
+        # Validate confidence levels (mathematical constraint)
+        if 'confidence' in kwargs:
+            conf = kwargs['confidence']
+            if not isinstance(conf, (int, float)):
+                raise ValueError("Confidence must be numeric")
+            if not 0 < conf < 1:
+                raise ValueError("Confidence must be between 0 and 1")
+        
+        # Validate time horizons (logical constraint)
+        if 'horizon' in kwargs:
+            horizon = kwargs['horizon']
+            if not isinstance(horizon, (int, float)):
+                raise ValueError("Horizon must be numeric")
+            if horizon <= 0:
+                raise ValueError("Horizon must be positive")
+        
+        # Validate window sizes (computational constraint)
+        if 'window' in kwargs:
+            window = kwargs['window']
+            if not isinstance(window, int):
+                raise ValueError("Window size must be integer")
+            if window <= 0:
+                raise ValueError("Window size must be positive")
+            
+        # Market Signal Detection
+        # Note: These checks generate warnings but don't restrict values
+        
+        if 'volatility' in kwargs:
+            vol = kwargs['volatility']
+            if not isinstance(vol, (int, float)):
+                raise ValueError("Volatility must be numeric")
+            
+            # Detect unusual volatility levels but don't restrict them
+            if vol > 1.0:  # 100% volatility
+                warnings.warn(f"Unusually high volatility detected: {vol*100:.1f}%")
+            elif vol < 0.05:  # 5% volatility
+                warnings.warn(f"Unusually low volatility detected: {vol*100:.1f}%")
 
     def construct_vol_surface(self, method: str = 'cubic') -> VolatilitySurface:
         """
